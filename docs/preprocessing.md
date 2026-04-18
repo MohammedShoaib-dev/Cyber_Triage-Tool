@@ -33,3 +33,6 @@ Loads raw CICIDS2017 network flow data and prepares it for the ML model.
 ## Dataset
 
 CICIDS2017 — cicids2017_cleaned.csv — 2,520,751 records, 53 columns
+
+## Next Step
+Output feeds into: [Anomaly Detection](anomaly_detection.md)
