@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+flask
+flask-cors
+pymongo
+reportlab
+python-evtx
+xmltodict
+joblib
