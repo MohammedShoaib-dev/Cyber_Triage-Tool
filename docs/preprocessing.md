@@ -26,9 +26,9 @@ Loads raw CICIDS2017 network flow data and prepares it for the ML model.
 - Packet Length Mean
 
 ## Output
-
-- df_scaled → (2,520,590 x 11) ready for Isolation Forest
-- df_raw → cleaned original data used for risk scoring and reports
+- df_scaled → (2,520,590 x 11) normalized, ready for ML model
+- df_raw    → original unmodified dataframe, for audit trail
+- df_clean  → cleaned dataframe, used for risk scoring and reports
 
 ## Dataset
 
