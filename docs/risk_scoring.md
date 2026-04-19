@@ -25,16 +25,20 @@ Range: 0 to 100
 
 ## Rule Weights
 
-| Rule                | Weight | Artifact Type |
-| ------------------- | ------ | ------------- |
-| High Packet Rate    | 0.8    | network       |
-| Long Flow Duration  | 0.6    | network       |
-| Large Byte Transfer | 0.7    | network       |
-| Low Packet Size     | 0.4    | network       |
-| High Failed Logins  | 0.9    | system_log    |
-| Odd Hour Login      | 0.6    | system_log    |
-| Executable in Temp  | 0.8    | file          |
-| Autorun Entry       | 0.9    | registry      |
+| Rule                    | Weight | Artifact Type |
+| ----------------------- | ------ | ------------- |
+| High Packet Rate        | 0.8    | network       |
+| Long Flow Duration      | 0.6    | network       |
+| Large Byte Transfer     | 0.7    | network       |
+| Low Packet Size         | 0.4    | network       |
+| High Failed Logins      | 0.9    | system_log    |
+| Odd Hour Login          | 0.6    | system_log    |
+| Privilege Escalation    | 1.0    | system_log    |
+| Executable in Temp      | 0.8    | file          |
+| Large File Created      | 0.5    | file          |
+| Hidden File Detected    | 0.7    | file          |
+| Autorun Entry           | 0.9    | registry      |
+| Suspicious Registry Key | 0.8    | registry      |
 
 ## Test Results
 

@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
+import logging
 
-# Rules organized by artifact type
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 RULES = {
     'network': {
         'high_packet_rate':    {'weight': 0.8, 'label': 'High Packet Rate'},
@@ -28,18 +31,26 @@ RULES = {
 class RiskScorer:
 
     def detect_artifact_type(self, row):
-        """Auto detect what kind of artifact this row is"""
-        keys = set(row.keys())
-        if 'Flow Duration' in keys or 'Flow Packets/s' in keys:
+        def has_value(col):
+            value = row.get(col)
+            if isinstance(value, str):
+                return value.strip() != ''
+            return pd.notna(value) if value is not None else False
+
+        explicit = row.get('artifact_type')
+        if isinstance(explicit, str) and explicit.strip().lower() in RULES:
+            return explicit.strip().lower()
+
+        if any(has_value(c) for c in ('Flow Duration','Flow Packets/s','Flow Bytes/s','Packet Length Mean')):
             return 'network'
-        elif 'EventID' in keys or 'LogonType' in keys:
+        elif any(has_value(c) for c in ('EventID','LogonType')):
             return 'system_log'
-        elif 'FileName' in keys or 'FileExtension' in keys:
+        elif any(has_value(c) for c in ('FileName','FileExtension')):
             return 'file'
-        elif 'RegistryKey' in keys or 'RegistryValue' in keys:
+        elif any(has_value(c) for c in ('RegistryKey','RegistryValue')):
             return 'registry'
         else:
-            return 'network'  # default to network for current dataset
+            return 'network'
 
     def apply_rules(self, row, artifact_type='network'):
         rule_score = 0.0
@@ -50,15 +61,12 @@ class RiskScorer:
                 if row.get('Flow Packets/s', 0) > 10000:
                     rule_score += RULES['network']['high_packet_rate']['weight']
                     matched_rules.append(RULES['network']['high_packet_rate']['label'])
-
                 if row.get('Flow Duration', 0) > 100000000:
                     rule_score += RULES['network']['long_flow_duration']['weight']
                     matched_rules.append(RULES['network']['long_flow_duration']['label'])
-
                 if row.get('Flow Bytes/s', 0) > 1000000:
                     rule_score += RULES['network']['large_byte_transfer']['weight']
                     matched_rules.append(RULES['network']['large_byte_transfer']['label'])
-
                 if row.get('Packet Length Mean', 0) < 10:
                     rule_score += RULES['network']['low_packet_size']['weight']
                     matched_rules.append(RULES['network']['low_packet_size']['label'])
@@ -67,25 +75,36 @@ class RiskScorer:
                 if row.get('FailedLogins', 0) > 5:
                     rule_score += RULES['system_log']['high_failed_logins']['weight']
                     matched_rules.append(RULES['system_log']['high_failed_logins']['label'])
-
                 if row.get('LoginHour', 12) < 6 or row.get('LoginHour', 12) > 22:
                     rule_score += RULES['system_log']['odd_login_hour']['weight']
                     matched_rules.append(RULES['system_log']['odd_login_hour']['label'])
+                if row.get('PrivilegeLevel', '') == 'SYSTEM':
+                    rule_score += RULES['system_log']['privilege_escalation']['weight']
+                    matched_rules.append(RULES['system_log']['privilege_escalation']['label'])
 
             elif artifact_type == 'file':
                 path = str(row.get('FilePath', ''))
                 if 'temp' in path.lower() and path.endswith('.exe'):
                     rule_score += RULES['file']['executable_in_temp']['weight']
                     matched_rules.append(RULES['file']['executable_in_temp']['label'])
+                if row.get('FileSizeBytes', 0) > 100000000:
+                    rule_score += RULES['file']['large_file_created']['weight']
+                    matched_rules.append(RULES['file']['large_file_created']['label'])
+                if str(row.get('FileName', '')).startswith('.'):
+                    rule_score += RULES['file']['hidden_file']['weight']
+                    matched_rules.append(RULES['file']['hidden_file']['label'])
 
             elif artifact_type == 'registry':
                 key = str(row.get('RegistryKey', ''))
                 if 'autorun' in key.lower() or 'run' in key.lower():
                     rule_score += RULES['registry']['autorun_entry']['weight']
                     matched_rules.append(RULES['registry']['autorun_entry']['label'])
+                if any(s in key.lower() for s in ('cmd','powershell','wscript','temp')):
+                    rule_score += RULES['registry']['suspicious_key']['weight']
+                    matched_rules.append(RULES['registry']['suspicious_key']['label'])
 
-        except Exception:
-            pass
+        except (KeyError, TypeError) as e:
+            logger.warning(f"Rule evaluation error at row: {e}")
 
         rule_score = min(rule_score, 1.0)
         return rule_score, matched_rules
@@ -95,11 +114,6 @@ class RiskScorer:
         return normalized * 100
 
     def compute_risk_score(self, anomaly_score, rule_score):
-        """
-        Risk Score Formula:
-        Risk = (Anomaly Score x 0.6) + (Rule Score x 100 x 0.4)
-        Range: 0 to 100
-        """
         risk = (anomaly_score * 0.6) + (rule_score * 100 * 0.4)
         return round(min(risk, 100), 2)
 
@@ -115,30 +129,44 @@ class RiskScorer:
 
     def score_dataframe(self, df_clean, anomaly_scores):
         print("[+] Scoring artifacts...")
-        results = []
+        total_records = len(df_clean)
+        columns = list(df_clean.columns)
 
-        for i, (_, row) in enumerate(df_clean.iterrows()):
-            row_dict = row.to_dict()
+        record_ids = np.arange(total_records, dtype=np.int64)
+        artifact_types = [None] * total_records
+        anomaly_score_values = np.empty(total_records, dtype=np.float64)
+        rule_score_values = np.empty(total_records, dtype=np.float64)
+        risk_score_values = np.empty(total_records, dtype=np.float64)
+        priorities = [None] * total_records
+        matched_rules_list = [None] * total_records
+
+        for i, row_values in enumerate(df_clean.itertuples(index=False, name=None)):
+            row_dict = dict(zip(columns, row_values))
             artifact_type = self.detect_artifact_type(row_dict)
             a_score = self.get_anomaly_score_normalized(anomaly_scores[i])
             r_score, rules = self.apply_rules(row_dict, artifact_type)
             risk = self.compute_risk_score(a_score, r_score)
-            priority = self.assign_priority(risk)
 
-            results.append({
-                'record_id': i,
-                'artifact_type': artifact_type,
-                'anomaly_score': round(a_score, 2),
-                'rule_score': round(r_score * 100, 2),
-                'risk_score': risk,
-                'priority': priority,
-                'matched_rules': ', '.join(rules) if rules else 'None'
-            })
+            artifact_types[i] = artifact_type
+            anomaly_score_values[i] = round(a_score, 2)
+            rule_score_values[i] = round(r_score * 100, 2)
+            risk_score_values[i] = risk
+            priorities[i] = self.assign_priority(risk)
+            matched_rules_list[i] = ', '.join(rules) if rules else 'None'
 
             if i % 100000 == 0:
-                print(f"[+] Processed {i}/{len(df_clean)} records...")
+                print(f"[+] Processed {i}/{total_records} records...")
 
-        df_results = pd.DataFrame(results)
+        df_results = pd.DataFrame({
+            'record_id': record_ids,
+            'artifact_type': artifact_types,
+            'anomaly_score': anomaly_score_values,
+            'rule_score': rule_score_values,
+            'risk_score': risk_score_values,
+            'priority': priorities,
+            'matched_rules': matched_rules_list
+        })
+
         df_results = df_results.sort_values('risk_score', ascending=False)
         print("[+] Scoring complete")
         return df_results
