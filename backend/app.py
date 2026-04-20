@@ -1,9 +1,12 @@
 import os
 import sys
+import uuid
+import logging
 
 import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -26,10 +29,15 @@ app = Flask(__name__)
 CORS(app)
 TEMP_DIR = os.path.join(ROOT_DIR, "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
+MODEL_PATH = os.path.join(ROOT_DIR, "models", "isolation_forest.pkl")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 preprocessor = ForensicPreprocessor()
 detector = AnomalyDetector(contamination=0.1)
 scorer = RiskScorer()
+DETECTOR_READY = False
 
 LABEL_COLUMN_CANDIDATES = ["Label", "label", "Class", "class", "Target", "target"]
 
@@ -44,9 +52,19 @@ def _save_uploaded_file():
 
     # Sanitize incoming filename before writing to disk.
     safe_name = secure_filename(uploaded_file.filename)
-    filepath = os.path.join(TEMP_DIR, safe_name)
+    ext = os.path.splitext(uploaded_file.filename)[1].lower() or ".csv"
+    if safe_name:
+        filename = f"{uuid.uuid4().hex}_{safe_name}"
+    else:
+        filename = f"{uuid.uuid4().hex}{ext}"
+
+    filepath = os.path.join(TEMP_DIR, filename)
     uploaded_file.save(filepath)
     return filepath, None
+
+
+def _api_error(message, status_code, code):
+    return jsonify({"error": {"code": code, "message": message}}), status_code
 
 
 def _extract_binary_ground_truth(df):
@@ -88,6 +106,22 @@ def _evaluate_predictions(y_true, predictions, decision_scores):
 
     return metrics
 
+
+def _ensure_detector_loaded_or_trained(df_scaled):
+    global DETECTOR_READY
+
+    if DETECTOR_READY:
+        return
+
+    if os.path.exists(MODEL_PATH):
+        detector.load_model(MODEL_PATH)
+        DETECTOR_READY = True
+        return
+
+    detector.train(df_scaled)
+    detector.save_model(MODEL_PATH)
+    DETECTOR_READY = True
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "cyber-triage-backend"})
@@ -104,7 +138,7 @@ def analyze():
         # run_pipeline returns (scaled, raw, clean)
         df_scaled, df_raw, df_clean = preprocessor.run_pipeline(filepath)
 
-        detector.train(df_scaled)
+        _ensure_detector_loaded_or_trained(df_scaled)
         predictions, scores = detector.predict(df_scaled)
         results_df = scorer.score_dataframe(df_clean, scores)
 
@@ -127,8 +161,9 @@ def analyze():
             }
 
         return jsonify(response_payload)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        logger.exception("Analysis request failed")
+        return _api_error("Analysis failed. Please check input data and try again.", 500, "ANALYSIS_FAILED")
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
@@ -154,30 +189,44 @@ def evaluate_model():
         df_scaled, _, df_clean = preprocessor.run_pipeline(filepath)
         y_true, label_column = _extract_binary_ground_truth(df_clean)
         if y_true is None:
-            return (
-                jsonify(
-                    {
-                        "error": "No label column found. Expected one of: "
-                        + ", ".join(LABEL_COLUMN_CANDIDATES)
-                    }
-                ),
+            return _api_error(
+                "No supported label column found.",
                 400,
+                "MISSING_LABEL_COLUMN",
             )
 
-        detector.train(df_scaled)
-        predictions, scores = detector.predict(df_scaled)
-        metrics = _evaluate_predictions(y_true, predictions, scores)
+        indices = np.arange(len(df_scaled))
+        stratify = y_true if len(np.unique(y_true)) > 1 else None
+        train_idx, test_idx = train_test_split(
+            indices,
+            test_size=0.3,
+            random_state=42,
+            stratify=stratify,
+        )
+
+        X_train = df_scaled.iloc[train_idx]
+        X_test = df_scaled.iloc[test_idx]
+        y_test = y_true[test_idx]
+
+        detector.train(X_train)
+        predictions, scores = detector.predict(X_test)
+        metrics = _evaluate_predictions(y_test, predictions, scores)
 
         return jsonify(
             {
                 "status": "ok",
                 "label_column": label_column,
-                "records_evaluated": int(len(df_clean)),
+                "records": {
+                    "total": int(len(df_clean)),
+                    "train": int(len(train_idx)),
+                    "test": int(len(test_idx)),
+                },
                 "metrics": metrics,
             }
         )
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        logger.exception("Evaluation request failed")
+        return _api_error("Evaluation failed. Please verify your labeled dataset.", 500, "EVALUATION_FAILED")
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
